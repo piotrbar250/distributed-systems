@@ -1,0 +1,25 @@
+[package]
+name = "lab-08"
+version = "0.2.1"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+bincode = { version = "2.0", features = ["serde"] }
+tokio = { version = "1.48", features = ["full"] }
+bytes = "1.11"
+uuid = { version = "1.18", features = ["v4", "serde"] }
+async-trait = "0.1"
+log = "0.4"
+
+module_system = { path = "../../Async-Message-Dispatcher/", package = "assignment-1-solution" }
+
+[dev-dependencies]
+ntest = "0.9"
+
+[[bin]]
+name = "lab08"
+path = "main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
