@@ -90,6 +90,12 @@ pub(crate) struct Disable;
 /// This structure serves as TM.
 pub(crate) struct DistributedStore {
     // Add any fields you need.
+    nodes: Vec<BoxedModuleSender<Node>>,
+    self_ref: BoxedModuleSender<Self>,
+    first_phase_cnt: usize,
+    second_phase_cnt: usize,
+    should_abort: bool,
+    completed_callback: Option<Box< dyn FnOnce(TwoPhaseResult) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
 }
 
 impl DistributedStore {
@@ -97,7 +103,14 @@ impl DistributedStore {
         nodes: Vec<BoxedModuleSender<Node>>,
         self_ref: BoxedModuleSender<Self>,
     ) -> Self {
-        unimplemented!()
+        Self {
+            nodes,
+            self_ref,
+            first_phase_cnt: 0, 
+            second_phase_cnt: 0,
+            should_abort: false,
+            completed_callback: None,
+        }
     }
 }
 
@@ -123,14 +136,75 @@ impl Node {
 #[async_trait::async_trait]
 impl Handler<TransactionMessage> for DistributedStore {
     async fn handle(&mut self, msg: TransactionMessage) {
-        unimplemented!()
+        if self.nodes.is_empty() {
+            (msg.completed_callback)(TwoPhaseResult::Ok).await;
+            return;
+        }
+
+        self.first_phase_cnt = 0; 
+        self.second_phase_cnt = 0;
+        self.should_abort = false;
+        self.completed_callback = Some(msg.completed_callback);
+    
+        for node in self.nodes.iter_mut() {
+            node.send(StoreMsg {
+                sender: self.self_ref.clone(),
+                content: StoreMsgContent::RequestVote(msg.transaction)
+            }).await;
+        }
+    }
+}
+
+impl DistributedStore {
+    async fn begin_second_phase(&mut self) {
+        let decision = if self.should_abort {
+            StoreMsgContent::Abort
+        } else {
+            StoreMsgContent::Commit
+        };
+
+        for node in self.nodes.iter_mut() {
+            node.send(StoreMsg {
+                sender: self.self_ref.clone(),
+                content: decision.clone()
+            }).await;
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Handler<NodeMsg> for DistributedStore {
     async fn handle(&mut self, msg: NodeMsg) {
-        unimplemented!()
+        match msg.content {
+            NodeMsgContent::RequestVoteResponse(TwoPhaseResult::Ok) => {
+                self.first_phase_cnt += 1;
+
+                if self.first_phase_cnt == self.nodes.len() {
+                    self.begin_second_phase().await;
+                }
+            },
+            NodeMsgContent::RequestVoteResponse(TwoPhaseResult::Abort) => {
+                self.should_abort = true;
+                self.first_phase_cnt += 1;
+
+                if self.first_phase_cnt == self.nodes.len() {
+                    self.begin_second_phase().await;
+                }
+            },
+            NodeMsgContent::FinalizationAck => {
+                self.second_phase_cnt += 1;
+                
+                if self.second_phase_cnt == self.nodes.len() {
+                    if let Some(completed_callback) = self.completed_callback.take() {
+                        if self.should_abort {
+                            completed_callback(TwoPhaseResult::Abort).await;
+                        } else {
+                            completed_callback(TwoPhaseResult::Ok).await;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -139,7 +213,47 @@ impl Handler<StoreMsg> for Node {
     async fn handle(&mut self, msg: StoreMsg) {
         if self.enabled {
             let mut sender = msg.sender;
-            unimplemented!()
+
+            match msg.content {
+                StoreMsgContent::RequestVote(transaction) => {
+                    for product in self.products.iter() {
+                        if product.pr_type == transaction.pr_type {
+                                let new_price = product.price as i128 + transaction.shift as i128;
+                                
+                                if new_price <= 0 || new_price > u64::MAX as i128 {
+                                    sender.send(NodeMsg {
+                                        content: NodeMsgContent::RequestVoteResponse(TwoPhaseResult::Abort)
+                                    }).await;
+                                    return;
+                                }
+                            }
+                    }
+                    self.pending_transaction = Some(transaction);
+                    sender.send(NodeMsg {
+                        content: NodeMsgContent::RequestVoteResponse(TwoPhaseResult::Ok)
+                    }).await;
+                },
+                StoreMsgContent::Commit => {
+                    if let Some(transaction) = self.pending_transaction {
+                        for product in self.products.iter_mut() {
+                            if product.pr_type == transaction.pr_type {
+                                let new_price = product.price as i128 + transaction.shift as i128;
+                                product.price = new_price as u64;
+                            }
+                        }
+                    }
+                    self.pending_transaction = None;
+                    sender.send(NodeMsg {
+                        content: NodeMsgContent::FinalizationAck
+                    }).await;
+                },
+                StoreMsgContent::Abort => {
+                    self.pending_transaction = None;
+                    sender.send(NodeMsg {
+                        content: NodeMsgContent::FinalizationAck
+                    }).await;
+                },
+            }
         }
     }
 }
@@ -148,7 +262,13 @@ impl Handler<StoreMsg> for Node {
 impl Handler<ProductPriceQuery> for Node {
     async fn handle(&mut self, msg: ProductPriceQuery) {
         if self.enabled {
-            unimplemented!()
+            for product in self.products.iter() {
+                if product.identifier == msg.product_ident {
+                    let _ = msg.result_sender.send(ProductPrice(Some(product.price)));
+                    return;
+                }
+            }
+            let _ = msg.result_sender.send(ProductPrice(None));
         }
     }
 }

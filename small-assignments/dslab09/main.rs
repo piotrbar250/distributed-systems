@@ -1,6 +1,7 @@
 mod public_test;
 mod relay_util;
 mod solution;
+mod kwasow;
 
 use crate::solution::{
     DistributedStore, Node, Product, ProductPrice, ProductPriceQuery, ProductType, Transaction,
