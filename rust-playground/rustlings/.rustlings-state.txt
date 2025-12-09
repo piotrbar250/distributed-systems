@@ -1,0 +1,10 @@
+DON'T EDIT THIS FILE!
+
+traits4
+
+intro1
+generics1
+generics2
+traits1
+traits2
+traits3
