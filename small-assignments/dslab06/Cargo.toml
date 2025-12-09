@@ -1,0 +1,26 @@
+[package]
+name = "lab-06"
+version = "0.2.1"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+tokio = { version = "1.48", features = ["full"] }
+sha2 = "0.10"
+base64 = "0.22"
+log = "0.4"
+
+[dev-dependencies]
+ntest = "0.9"
+tempfile = "3.14"
+
+[lib]
+name = "lab_06"
+path = "solution.rs"
+
+[[bin]]
+name = "lab06"
+path = "main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
