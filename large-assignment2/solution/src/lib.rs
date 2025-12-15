@@ -613,26 +613,26 @@ async fn sector_worker(
 
     loop {
         select! {
-                Some(cmd) = rx.recv() => {
-                    match cmd {
-                        SectorMsg::System(system_cmd) => {
-                            atomic_register.system_command(system_cmd).await;
-                        },
+            Some(cmd) = rx.recv() => {
+                match cmd {
+                    SectorMsg::System(system_cmd) => {
+                        atomic_register.system_command(system_cmd).await;
+                    },
 
-                        SectorMsg::Client { client_cmd, oneshot_tx} => {
-                            pending.push_back(ClientTask {
-                                cmd: client_cmd,
-                                respond_to: oneshot_tx,
-                            });
-                        }                        
-                    }
-                    try_start_next_client(&mut busy, &mut pending, ready_tx.clone(), &mut atomic_register).await;
+                    SectorMsg::Client { client_cmd, oneshot_tx} => {
+                        pending.push_back(ClientTask {
+                            cmd: client_cmd,
+                            respond_to: oneshot_tx,
+                        });
+                    }                        
                 }
-                Some(()) = ready_rx.recv() => {
-                    busy = false;
-                    try_start_next_client(&mut busy, &mut pending, ready_tx.clone(), &mut atomic_register).await;
-                }
+                try_start_next_client(&mut busy, &mut pending, ready_tx.clone(), &mut atomic_register).await;
             }
+            Some(()) = ready_rx.recv() => {
+                busy = false;
+                try_start_next_client(&mut busy, &mut pending, ready_tx.clone(), &mut atomic_register).await;
+            }
+        }
     }
    
 }
