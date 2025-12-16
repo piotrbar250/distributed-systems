@@ -130,10 +130,13 @@ pub async fn run_register_process(config: Configuration) {
         tokio::spawn(sender_worker(addr, rx, config.hmac_system_key.clone()));
     }
 
+    let (local_tx, mut local_rx) = unbounded_channel();
+
     let register_client: Arc<dyn RegisterClient> = Arc::new(MyRegisterClient {
         self_ident: self_rank,
         processes_count: n,
-        internal_tx
+        local_tx,
+        internal_tx,
     });
 
     let dispatcher = Dispatcher {
@@ -143,6 +146,13 @@ pub async fn run_register_process(config: Configuration) {
         router: Mutex::new(HashMap::new())
     };
     let dispatcher = Arc::new(dispatcher);
+
+    let dispatcher_local = Arc::clone(&dispatcher);
+    tokio::spawn(async move {
+        while let Some(cmd) = local_rx.recv().await {
+            dispatcher_local.handle_system((*cmd).clone()).await;
+        }
+    });
 
     loop {
         let (socket, _client_addr) = listener.accept().await.unwrap();
@@ -156,6 +166,8 @@ pub async fn run_register_process(config: Configuration) {
 
 pub mod atomic_register_public {
     use hmac::digest::consts::False;
+    use tokio::sync::Mutex;
+    use tokio::time::interval;
     use uuid::Uuid;
 
     use crate::{
@@ -166,6 +178,7 @@ pub mod atomic_register_public {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[async_trait::async_trait]
     pub trait AtomicRegister: core::marker::Send + Sync {
@@ -226,7 +239,88 @@ pub mod atomic_register_public {
             writeval: None,
             pending_req_id: None,
             pending_callback: None,
+            resend_state: Arc::new(Mutex::new(None)),
         })
+    }
+
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ResendPhase {
+        Query,
+        WriteBack,
+    }
+
+    #[derive(Debug)]
+    struct ResendState {
+        op_id: Uuid,
+        phase: ResendPhase,
+        done: bool,
+        read_proc: Arc<SystemRegisterCommand>,
+        write_proc: Option<Arc<SystemRegisterCommand>>,
+        missing_values: Vec<bool>,
+        missing_acks: Vec<bool>,
+    }
+
+    fn spawn_resender(
+        register_client: Arc<dyn RegisterClient>,
+        processes_count: u8,
+        state: Arc<Mutex<Option<ResendState>>>,
+        op_id: Uuid,
+    ) {
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_millis(150));
+
+            loop {
+                tick.tick().await;
+
+                let snapshot = {
+                    let guard = state.lock().await;
+                    let Some(st) = guard.as_ref() else { return; };
+                    if st.op_id != op_id { return; }
+                    if st.done { return; }
+
+                    (
+                        st.phase,
+                        Arc::clone(&st.read_proc),
+                        st.write_proc.as_ref().map(Arc::clone),
+                        st.missing_values.clone(),
+                        st.missing_acks.clone(),
+                    )
+                };
+
+                let (phase, read_proc, write_proc, missing_values, missing_acks) = snapshot;
+
+                match phase {
+                    ResendPhase::Query => {
+                        for target in 1..=processes_count {
+                            let idx = target as usize;
+                            if idx < missing_values.len() && missing_values[idx] {
+                                register_client
+                                    .send(Send {
+                                        cmd: Arc::clone(&read_proc),
+                                        target,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    ResendPhase::WriteBack => {
+                        let Some(write_proc) = write_proc else { continue };
+                        for target in 1..=processes_count {
+                            let idx = target as usize;
+                            if idx < missing_acks.len() && missing_acks[idx] {
+                                register_client
+                                    .send(Send {
+                                        cmd: Arc::clone(&write_proc),
+                                        target,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     enum Mode { Idle, Reading, Writing }
@@ -250,6 +344,7 @@ pub mod atomic_register_public {
         writeval: Option<SectorVec>,
         pending_req_id: Option<u64>,
         pending_callback: Option<SuccessCb>,
+        resend_state: Arc<Mutex<Option<ResendState>>>,
     }
 
     impl MyAtomicRegister {
@@ -299,15 +394,43 @@ pub mod atomic_register_public {
                 }
             }
 
+            let msg = Arc::new(SystemRegisterCommand { 
+                header: SystemCommandHeader {
+                    process_identifier: self.self_ident,
+                    msg_ident: op_id,
+                    sector_idx: self.sector_idx,
+                }, 
+                content: SystemRegisterCommandContent::ReadProc
+            });
+
+            let mut missing_values = vec![false; (self.processes_count as usize) + 1];
+            for r in 1..=self.processes_count {
+                missing_values[r as usize] = true;
+            }
+            let missing_acks = vec![false; (self.processes_count as usize) + 1];
+
+            {
+                let mut guard = self.resend_state.lock().await;
+                *guard = Some(ResendState {
+                    op_id,
+                    phase: ResendPhase::Query,
+                    done: false,
+                    read_proc: Arc::clone(&msg),
+                    write_proc: None,
+                    missing_values,
+                    missing_acks,
+                });
+            }
+
+            spawn_resender(
+                Arc::clone(&self.register_client),
+                self.processes_count,
+                Arc::clone(&self.resend_state),
+                op_id,
+            );
+
             self.register_client.broadcast(Broadcast {
-                cmd: Arc::new(SystemRegisterCommand { 
-                    header: SystemCommandHeader {
-                        process_identifier: self.self_ident,
-                        msg_ident: op_id,
-                        sector_idx: self.sector_idx,
-                    }, 
-                    content: SystemRegisterCommandContent::ReadProc
-                })
+                cmd: msg
             }).await;
         }
 
@@ -347,6 +470,18 @@ pub mod atomic_register_public {
                     self.value_from.insert(cmd.header.process_identifier);
                     self.update_max_value(Some((timestamp, write_rank, sector_data)));
 
+                    {
+                        let mut guard = self.resend_state.lock().await;
+                        if let Some(st) = guard.as_mut() {
+                            if st.op_id == cmd.header.msg_ident {
+                                let src = cmd.header.process_identifier as usize;
+                                if src < st.missing_values.len() {
+                                    st.missing_values[src] = false;
+                                }
+                            }
+                        }
+                    }
+
                     if self.value_from.len() >= majority {
                         self.phase = Phase::WriteBack;
                         self.ack_from.clear();
@@ -355,7 +490,7 @@ pub mod atomic_register_public {
                             Mode::Reading => {
                                 let (ts, wr, val) = self.max_value_seen.as_ref().unwrap().clone();
 
-                                let msg = SystemRegisterCommand { 
+                                let msg = Arc::new(SystemRegisterCommand { 
                                     header: SystemCommandHeader {
                                         process_identifier: self.self_ident,
                                         msg_ident: op_id,
@@ -366,10 +501,25 @@ pub mod atomic_register_public {
                                         write_rank: wr, 
                                         data_to_write: val,
                                     },
-                                };
+                                });
+
+                                {
+                                    let mut guard = self.resend_state.lock().await;
+                                    if let Some(st) = guard.as_mut() {
+                                        if st.op_id == op_id {
+                                            st.phase = ResendPhase::WriteBack;
+                                            st.write_proc = Some(Arc::clone(&msg));
+
+                                            st.missing_acks = vec![false; (self.processes_count as usize) + 1];
+                                            for r in 1..=self.processes_count {
+                                                st.missing_acks[r as usize] = true;
+                                            }
+                                        }
+                                    }
+                                }
                                 
                                 self.register_client.broadcast(Broadcast {
-                                    cmd: Arc::new(msg)
+                                    cmd: msg
                                 }).await;
                             },
                             Mode::Writing => {
@@ -385,7 +535,7 @@ pub mod atomic_register_public {
 
                                 self.sectors_manager.write(self.sector_idx, &(new_val.clone(), new_ts, new_wr)).await;
 
-                                let msg = SystemRegisterCommand { 
+                                let msg = Arc::new(SystemRegisterCommand { 
                                     header: SystemCommandHeader {
                                         process_identifier: self.self_ident,
                                         msg_ident: op_id,
@@ -396,10 +546,25 @@ pub mod atomic_register_public {
                                         write_rank: new_wr,
                                         data_to_write: new_val,
                                     },
-                                };
+                                });
+
+                                {
+                                    let mut guard = self.resend_state.lock().await;
+                                    if let Some(st) = guard.as_mut() {
+                                        if st.op_id == op_id {
+                                            st.phase = ResendPhase::WriteBack;
+                                            st.write_proc = Some(Arc::clone(&msg));
+
+                                            st.missing_acks = vec![false; (self.processes_count as usize) + 1];
+                                            for r in 1..=self.processes_count {
+                                                st.missing_acks[r as usize] = true;
+                                            }
+                                        }
+                                    }
+                                }
 
                                 self.register_client.broadcast(Broadcast {
-                                    cmd: Arc::new(msg)
+                                    cmd: msg
                                 }).await;
                             },
                             Mode::Idle => {},
@@ -443,6 +608,18 @@ pub mod atomic_register_public {
                     }
                     self.ack_from.insert(cmd.header.process_identifier);
 
+                    {
+                        let mut guard = self.resend_state.lock().await;
+                        if let Some(st) = guard.as_mut() {
+                            if st.op_id == cmd.header.msg_ident {
+                                let src = cmd.header.process_identifier as usize;
+                                if src < st.missing_acks.len() {
+                                    st.missing_acks[src] = false;
+                                }
+                            }
+                        }
+                    }
+
                     if self.ack_from.len() >= majority {
                         let req_id = self.pending_req_id.take().unwrap();
                         let cb = self.pending_callback.take().unwrap();
@@ -474,6 +651,17 @@ pub mod atomic_register_public {
                         self.value_from.clear();
                         self.ack_from.clear();
 
+                        {
+                            let mut guard = self.resend_state.lock().await;
+                            if let Some(st) = guard.as_mut() {
+                                if st.op_id == op_id {
+                                    st.done = true;
+                                }
+                            }
+                            // optional: clear state entirely
+                            *guard = None;
+                        }
+
                         cb(response).await;
 
                     }
@@ -482,49 +670,6 @@ pub mod atomic_register_public {
         }
     }
 }
-
-pub mod sectors_manager_public {
-    use crate::{SectorIdx, SectorVec, zero_sector};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    #[async_trait::async_trait]
-    pub trait SectorsManager: Send + Sync {
-        /// Returns 4096 bytes of sector data by index.
-        async fn read_data(&self, idx: SectorIdx) -> SectorVec;
-
-        /// Returns timestamp and write rank of the process which has saved this data.
-        /// Timestamps and ranks are relevant for atomic register algorithm, and are described
-        /// there.
-        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8);
-
-        /// Writes a new data, along with timestamp and write rank to some sector.
-        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8));
-    }
-
-    /// Path parameter points to a directory to which this method has exclusive access.
-    pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-       Arc::new(MySectorsManager { })
-    }
-
-    struct MySectorsManager {}
-    
-    #[async_trait::async_trait]
-    impl SectorsManager for MySectorsManager {
-        async fn read_data(&self, idx: SectorIdx) -> SectorVec {
-            return zero_sector();
-        }
-
-        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8) {
-            return (0, 0);
-        }
-
-        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8)) {
-
-        }
-    }
-}
-
 
 struct Dispatcher {
     config: Arc<Configuration>,
@@ -826,13 +971,19 @@ pub mod register_client_public {
     pub struct MyRegisterClient {
         pub self_ident: u8,
         pub processes_count: u8,
-        pub internal_tx: Vec<Option<UnboundedSender<Arc<SystemRegisterCommand>>>>
+        pub local_tx: UnboundedSender<Arc<SystemRegisterCommand>>,
+        pub internal_tx: Vec<Option<UnboundedSender<Arc<SystemRegisterCommand>>>>,
     }
 
 
     #[async_trait::async_trait]
     impl RegisterClient for MyRegisterClient {
         async fn send(&self, msg: Send) {
+            if msg.target == self.self_ident {
+                let _ = self.local_tx.send(Arc::clone(&msg.cmd));
+                return;
+            }
+
             if let Some(tx) = &self.internal_tx[msg.target as usize] {
                 tx.send(msg.cmd).unwrap();
             } else {
@@ -846,6 +997,266 @@ pub mod register_client_public {
                     cmd: Arc::clone(&msg.cmd),
                     target,
                 }).await;
+            }
+        }
+    }
+}
+
+pub mod sectors_manager_public {
+    use crate::{zero_sector, SectorIdx, SectorVec, SECTOR_SIZE};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use tokio::fs::{self, File};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Mutex, RwLock};
+    use uuid::Uuid;
+
+    #[async_trait::async_trait]
+    pub trait SectorsManager: Send + Sync {
+        async fn read_data(&self, idx: SectorIdx) -> SectorVec;
+        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8);
+        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8));
+    }
+
+    pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
+        fs::create_dir_all(&path).await.unwrap();
+        let tmp_dir = path.join("tmp");
+        fs::create_dir_all(&tmp_dir).await.unwrap();
+
+        // Open directory handles for fsync (works on Unix; assignment targets Linux-like).
+        let root_dir_handle = File::open(&path).await.unwrap();
+        let tmp_dir_handle = File::open(&tmp_dir).await.unwrap();
+
+        let mgr = MySectorsManager {
+            root_dir: path,
+            tmp_dir,
+            root_dir_handle,
+            tmp_dir_handle,
+            index: RwLock::new(HashMap::new()),
+            stripes: (0..256).map(|_| Mutex::new(())).collect(),
+        };
+
+        mgr.recover().await;
+        Arc::new(mgr)
+    }
+
+    /// Filename format:
+    ///   s<idx_hex>_t<ts_hex>_w<wr_hex>.bin
+    /// Example:
+    ///   s000000000000000c_t0000000000000001_w01.bin
+    ///
+    /// Metadata lives in filename to keep per-sector overhead tiny.
+    struct MySectorsManager {
+        root_dir: PathBuf,
+        tmp_dir: PathBuf,
+
+        root_dir_handle: File,
+        tmp_dir_handle: File,
+
+        /// In-memory index: sector -> (ts, wr, filename)
+        /// Memory is linear in number of written sectors.
+        index: RwLock<HashMap<SectorIdx, (u64, u8, String)>>,
+
+        /// Fixed striped locks for concurrent ops on different sectors.
+        stripes: Vec<Mutex<()>>,
+    }
+
+    impl MySectorsManager {
+        fn stripe(&self, idx: SectorIdx) -> &Mutex<()> {
+            let n = self.stripes.len() as u64;
+            &self.stripes[(idx % n) as usize]
+        }
+
+        fn make_filename(idx: SectorIdx, ts: u64, wr: u8) -> String {
+            format!("s{idx:016x}_t{ts:016x}_w{wr:02x}.bin")
+        }
+
+        fn parse_filename(name: &str) -> Option<(SectorIdx, u64, u8)> {
+            // Expect "s<idx>_t<ts>_w<wr>.bin"
+            let name = name.strip_suffix(".bin")?;
+            let mut parts = name.split('_');
+
+            let s_part = parts.next()?;
+            let t_part = parts.next()?;
+            let w_part = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+
+            let idx_hex = s_part.strip_prefix('s')?;
+            let ts_hex = t_part.strip_prefix('t')?;
+            let wr_hex = w_part.strip_prefix('w')?;
+
+            let idx = u64::from_str_radix(idx_hex, 16).ok()?;
+            let ts = u64::from_str_radix(ts_hex, 16).ok()?;
+            let wr_u8 = u8::from_str_radix(wr_hex, 16).ok()?;
+            Some((idx, ts, wr_u8))
+        }
+
+        fn is_newer(a: (u64, u8), b: (u64, u8)) -> bool {
+            // a > b in lexicographic order (ts, wr)
+            a.0 > b.0 || (a.0 == b.0 && a.1 > b.1)
+        }
+
+        async fn sync_dir(dir_handle: &File) {
+            // fsync directory so renames/unlinks are durable
+            let _ = dir_handle.sync_data().await;
+        }
+
+        async fn recover(&self) {
+            // 1) Clear tmp dir (stale partial writes)
+            if let Ok(mut rd) = fs::read_dir(&self.tmp_dir).await {
+                while let Ok(Some(ent)) = rd.next_entry().await {
+                    let _ = fs::remove_file(ent.path()).await;
+                }
+            }
+            Self::sync_dir(&self.tmp_dir_handle).await;
+
+            // 2) Scan root dir, keep newest per sector, delete stale duplicates
+            let mut best: HashMap<SectorIdx, (u64, u8, String)> = HashMap::new();
+            let mut all_files: Vec<(SectorIdx, u64, u8, String)> = Vec::new();
+
+            if let Ok(mut rd) = fs::read_dir(&self.root_dir).await {
+                while let Ok(Some(ent)) = rd.next_entry().await {
+                    let file_name_os = ent.file_name();
+                    let file_name = match file_name_os.to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+
+                    // Ignore our tmp dir entry and any unknown files.
+                    if file_name == "tmp" {
+                        continue;
+                    }
+
+                    if let Some((idx, ts, wr)) = Self::parse_filename(&file_name) {
+                        all_files.push((idx, ts, wr, file_name.clone()));
+                        match best.get(&idx) {
+                            None => {
+                                best.insert(idx, (ts, wr, file_name));
+                            }
+                            Some((bts, bwr, _)) => {
+                                if Self::is_newer((ts, wr), (*bts, *bwr)) {
+                                    best.insert(idx, (ts, wr, file_name));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Delete non-best files
+            for (idx, ts, wr, fname) in all_files {
+                let keep = best
+                    .get(&idx)
+                    .map(|(bts, bwr, bf)| *bts == ts && *bwr == wr && bf == &fname)
+                    .unwrap_or(false);
+
+                if !keep {
+                    let _ = fs::remove_file(self.root_dir.join(&fname)).await;
+                }
+            }
+            Self::sync_dir(&self.root_dir_handle).await;
+
+            // Publish recovered index
+            let mut idx_guard = self.index.write().await;
+            *idx_guard = best;
+        }
+
+        async fn read_file_exact_4096(path: &Path) -> Option<SectorVec> {
+            let mut f = File::open(path).await.ok()?;
+            let mut buf = [0u8; SECTOR_SIZE];
+            if f.read_exact(&mut buf).await.is_err() {
+                return None;
+            }
+            Some(SectorVec(Box::new(serde_big_array::Array(buf))))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SectorsManager for MySectorsManager {
+        async fn read_data(&self, idx: SectorIdx) -> SectorVec {
+            let _g = self.stripe(idx).lock().await;
+
+            let entry = { self.index.read().await.get(&idx).cloned() };
+            let Some((_ts, _wr, fname)) = entry else {
+                return zero_sector();
+            };
+
+            let path = self.root_dir.join(fname);
+            match Self::read_file_exact_4096(&path).await {
+                Some(v) => v,
+                None => zero_sector(),
+            }
+        }
+
+        async fn read_metadata(&self, idx: SectorIdx) -> (u64, u8) {
+            let _g = self.stripe(idx).lock().await;
+
+            match self.index.read().await.get(&idx) {
+                Some((ts, wr, _)) => (*ts, *wr),
+                None => (0, 0),
+            }
+        }
+
+        async fn write(&self, idx: SectorIdx, sector: &(SectorVec, u64, u8)) {
+            let _g = self.stripe(idx).lock().await;
+
+            let (data, ts, wr) = sector;
+
+            // 1) Write to a unique temp file
+            let tmp_name = format!("tmp-{}-{}.bin", idx, Uuid::new_v4());
+            let tmp_path = self.tmp_dir.join(&tmp_name);
+
+            {
+                let mut f = File::create(&tmp_path).await.unwrap();
+                f.write_all(data.0.as_slice()).await.unwrap();
+                f.sync_data().await.unwrap();
+            }
+            Self::sync_dir(&self.tmp_dir_handle).await;
+
+            // 2) Atomically install via rename to final name
+            let final_name = Self::make_filename(idx, *ts, *wr);
+            let final_path = self.root_dir.join(&final_name);
+
+            // On Unix, rename over an existing file is atomic replacement.
+            fs::rename(&tmp_path, &final_path).await.unwrap();
+            Self::sync_dir(&self.root_dir_handle).await;
+
+            // 3) Update in-memory index & remove old file (if any)
+            let old = {
+                let mut map = self.index.write().await;
+                let old = map.get(&idx).cloned();
+
+                match old {
+                    None => {
+                        map.insert(idx, (*ts, *wr, final_name.clone()));
+                        None
+                    }
+                    Some((old_ts, old_wr, old_fname)) => {
+                        // Keep the newest (ts,wr)
+                        if MySectorsManager::is_newer((*ts, *wr), (old_ts, old_wr)) {
+                            map.insert(idx, (*ts, *wr, final_name.clone()));
+                            Some(old_fname)
+                        } else {
+                            // If caller tries to write older data, keep current index.
+                            // Still installed a file; clean it up below.
+                            Some(final_name.clone())
+                        }
+                    }
+                }
+            };
+
+            if let Some(old_fname) = old {
+                // If old_fname equals final_name, do nothing.
+                if old_fname != final_name {
+                    let _ = fs::remove_file(self.root_dir.join(old_fname)).await;
+                } else {
+                    // We "installed" a file but decided it's not the newest. Remove it.
+                    let _ = fs::remove_file(self.root_dir.join(&final_name)).await;
+                }
+                Self::sync_dir(&self.root_dir_handle).await;
             }
         }
     }
