@@ -166,7 +166,7 @@ pub async fn run_register_process(config: Configuration) {
 
 pub mod atomic_register_public {
     use hmac::digest::consts::False;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
     use tokio::time::interval;
     use uuid::Uuid;
 
@@ -221,6 +221,16 @@ pub mod atomic_register_public {
         let (ts, wr) = sectors_manager.read_metadata(sector_idx).await;
         let val = sectors_manager.read_data(sector_idx).await;
 
+        let resend_state = Arc::new(Mutex::new(None));
+        let resend_notify = Arc::new(Notify::new());
+
+        tokio::spawn(stubborn_resender(
+            Arc::clone(&register_client),
+            processes_count,
+            Arc::clone(&resend_state),
+            Arc::clone(&resend_notify),
+        ));
+
         Box::new(MyAtomicRegister {
             self_ident,
             sector_idx,
@@ -239,90 +249,63 @@ pub mod atomic_register_public {
             writeval: None,
             pending_req_id: None,
             pending_callback: None,
-            resend_state: Arc::new(Mutex::new(None)),
+            resend_state,
+            resend_notify
         })
     }
 
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum ResendPhase {
-        Query,
-        WriteBack,
-    }
-
-    #[derive(Debug)]
     struct ResendState {
-        op_id: Uuid,
-        phase: ResendPhase,
-        done: bool,
-        read_proc: Arc<SystemRegisterCommand>,
-        write_proc: Option<Arc<SystemRegisterCommand>>,
-        missing_values: Vec<bool>,
-        missing_acks: Vec<bool>,
+        cmd: Arc<SystemRegisterCommand>,
+        missing: Vec<bool>,
     }
 
-    fn spawn_resender(
+    async fn stubborn_resender(
         register_client: Arc<dyn RegisterClient>,
         processes_count: u8,
         state: Arc<Mutex<Option<ResendState>>>,
-        op_id: Uuid,
+        notify: Arc<Notify>,
     ) {
-        tokio::spawn(async move {
+        loop {
+            loop {
+                if state.lock().await.is_some() {
+                    break;
+                }
+                notify.notified().await;
+            }
+
             let mut tick = interval(Duration::from_millis(150));
 
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = notify.notified() => {}
+                }
 
-                let snapshot = {
-                    let guard = state.lock().await;
-                    let Some(st) = guard.as_ref() else { return; };
-                    if st.op_id != op_id { return; }
-                    if st.done { return; }
+                let (cmd, targets): (Arc<SystemRegisterCommand>, Vec<u8>) = {
+                    let g = state.lock().await;
+                    let Some(st) = g.as_ref() else {
+                        break;
+                    };
 
-                    (
-                        st.phase,
-                        Arc::clone(&st.read_proc),
-                        st.write_proc.as_ref().map(Arc::clone),
-                        st.missing_values.clone(),
-                        st.missing_acks.clone(),
-                    )
+                    let mut targets = Vec::new();
+                    for t in 1..=processes_count {
+                        if st.missing.get(t as usize).copied().unwrap_or(false) {
+                            targets.push(t);
+                        }
+                    }
+
+                    (Arc::clone(&st.cmd), targets)
                 };
 
-                let (phase, read_proc, write_proc, missing_values, missing_acks) = snapshot;
-
-                match phase {
-                    ResendPhase::Query => {
-                        for target in 1..=processes_count {
-                            let idx = target as usize;
-                            if idx < missing_values.len() && missing_values[idx] {
-                                register_client
-                                    .send(Send {
-                                        cmd: Arc::clone(&read_proc),
-                                        target,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    ResendPhase::WriteBack => {
-                        let Some(write_proc) = write_proc else { continue };
-                        for target in 1..=processes_count {
-                            let idx = target as usize;
-                            if idx < missing_acks.len() && missing_acks[idx] {
-                                register_client
-                                    .send(Send {
-                                        cmd: Arc::clone(&write_proc),
-                                        target,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
+                for target in targets {
+                    register_client
+                        .send(Send { cmd: Arc::clone(&cmd), target })
+                        .await;
                 }
             }
-        });
+        }
     }
-
+    
     enum Mode { Idle, Reading, Writing }
     enum Phase { Query, WriteBack }
 
@@ -345,6 +328,7 @@ pub mod atomic_register_public {
         pending_req_id: Option<u64>,
         pending_callback: Option<SuccessCb>,
         resend_state: Arc<Mutex<Option<ResendState>>>,
+        resend_notify: Arc<Notify>,
     }
 
     impl MyAtomicRegister {
@@ -403,31 +387,19 @@ pub mod atomic_register_public {
                 content: SystemRegisterCommandContent::ReadProc
             });
 
-            let mut missing_values = vec![false; (self.processes_count as usize) + 1];
+            let mut missing = vec![false; (self.processes_count as usize) + 1];
             for r in 1..=self.processes_count {
-                missing_values[r as usize] = true;
+                missing[r as usize] = true;
             }
-            let missing_acks = vec![false; (self.processes_count as usize) + 1];
 
             {
-                let mut guard = self.resend_state.lock().await;
-                *guard = Some(ResendState {
-                    op_id,
-                    phase: ResendPhase::Query,
-                    done: false,
-                    read_proc: Arc::clone(&msg),
-                    write_proc: None,
-                    missing_values,
-                    missing_acks,
+                let mut g = self.resend_state.lock().await;
+                *g = Some(ResendState {
+                    cmd: Arc::clone(&msg),
+                    missing,
                 });
             }
-
-            spawn_resender(
-                Arc::clone(&self.register_client),
-                self.processes_count,
-                Arc::clone(&self.resend_state),
-                op_id,
-            );
+            self.resend_notify.notify_one();
 
             self.register_client.broadcast(Broadcast {
                 cmd: msg
@@ -439,26 +411,32 @@ pub mod atomic_register_public {
 
             match cmd.content {
                 SystemRegisterCommandContent::ReadProc => {
-                    let reply = SystemRegisterCommand { 
+                    let reply = SystemRegisterCommand {
                         header: SystemCommandHeader {
                             process_identifier: self.self_ident,
                             msg_ident: cmd.header.msg_ident,
                             sector_idx: self.sector_idx,
-                        }, 
+                        },
                         content: SystemRegisterCommandContent::Value {
                             timestamp: self.ts,
                             write_rank: self.wr,
                             sector_data: self.val.clone(),
-                        }
+                        },
                     };
 
-                    self.register_client.send(Send {
-                        cmd: Arc::new(reply),
-                        target: cmd.header.process_identifier
-                    }).await;
-                },
-                SystemRegisterCommandContent::Value { timestamp, write_rank, sector_data } => {
-                    
+                    self.register_client
+                        .send(Send {
+                            cmd: Arc::new(reply),
+                            target: cmd.header.process_identifier,
+                        })
+                        .await;
+                }
+
+                SystemRegisterCommandContent::Value {
+                    timestamp,
+                    write_rank,
+                    sector_data,
+                } => {
                     let Some(op_id) = self.op_id else { return; };
                     if op_id != cmd.header.msg_ident { return; }
                     if !matches!(self.phase, Phase::Query) { return; }
@@ -471,13 +449,11 @@ pub mod atomic_register_public {
                     self.update_max_value(Some((timestamp, write_rank, sector_data)));
 
                     {
-                        let mut guard = self.resend_state.lock().await;
-                        if let Some(st) = guard.as_mut() {
-                            if st.op_id == cmd.header.msg_ident {
-                                let src = cmd.header.process_identifier as usize;
-                                if src < st.missing_values.len() {
-                                    st.missing_values[src] = false;
-                                }
+                        let mut g = self.resend_state.lock().await;
+                        if let Some(st) = g.as_mut() {
+                            let src = cmd.header.process_identifier as usize;
+                            if src < st.missing.len() {
+                                st.missing[src] = false;
                             }
                         }
                     }
@@ -490,38 +466,37 @@ pub mod atomic_register_public {
                             Mode::Reading => {
                                 let (ts, wr, val) = self.max_value_seen.as_ref().unwrap().clone();
 
-                                let msg = Arc::new(SystemRegisterCommand { 
+                                let msg = Arc::new(SystemRegisterCommand {
                                     header: SystemCommandHeader {
                                         process_identifier: self.self_ident,
                                         msg_ident: op_id,
                                         sector_idx: self.sector_idx,
-                                    }, 
+                                    },
                                     content: SystemRegisterCommandContent::WriteProc {
                                         timestamp: ts,
-                                        write_rank: wr, 
+                                        write_rank: wr,
                                         data_to_write: val,
                                     },
                                 });
 
-                                {
-                                    let mut guard = self.resend_state.lock().await;
-                                    if let Some(st) = guard.as_mut() {
-                                        if st.op_id == op_id {
-                                            st.phase = ResendPhase::WriteBack;
-                                            st.write_proc = Some(Arc::clone(&msg));
-
-                                            st.missing_acks = vec![false; (self.processes_count as usize) + 1];
-                                            for r in 1..=self.processes_count {
-                                                st.missing_acks[r as usize] = true;
-                                            }
-                                        }
-                                    }
+                                let mut missing = vec![false; (self.processes_count as usize) + 1];
+                                for r in 1..=self.processes_count {
+                                    missing[r as usize] = true;
                                 }
-                                
-                                self.register_client.broadcast(Broadcast {
-                                    cmd: msg
-                                }).await;
-                            },
+                                {
+                                    let mut g = self.resend_state.lock().await;
+                                    *g = Some(ResendState {
+                                        cmd: Arc::clone(&msg),
+                                        missing,
+                                    });
+                                }
+                                self.resend_notify.notify_one();
+
+                                self.register_client
+                                    .broadcast(Broadcast { cmd: msg })
+                                    .await;
+                            }
+
                             Mode::Writing => {
                                 let max_ts = self.max_value_seen.as_ref().unwrap().0;
 
@@ -533,14 +508,16 @@ pub mod atomic_register_public {
                                 self.wr = new_wr;
                                 self.val = new_val.clone();
 
-                                self.sectors_manager.write(self.sector_idx, &(new_val.clone(), new_ts, new_wr)).await;
+                                self.sectors_manager
+                                    .write(self.sector_idx, &(new_val.clone(), new_ts, new_wr))
+                                    .await;
 
-                                let msg = Arc::new(SystemRegisterCommand { 
+                                let msg = Arc::new(SystemRegisterCommand {
                                     header: SystemCommandHeader {
                                         process_identifier: self.self_ident,
                                         msg_ident: op_id,
                                         sector_idx: self.sector_idx,
-                                    }, 
+                                    },
                                     content: SystemRegisterCommandContent::WriteProc {
                                         timestamp: new_ts,
                                         write_rank: new_wr,
@@ -548,56 +525,63 @@ pub mod atomic_register_public {
                                     },
                                 });
 
-                                {
-                                    let mut guard = self.resend_state.lock().await;
-                                    if let Some(st) = guard.as_mut() {
-                                        if st.op_id == op_id {
-                                            st.phase = ResendPhase::WriteBack;
-                                            st.write_proc = Some(Arc::clone(&msg));
-
-                                            st.missing_acks = vec![false; (self.processes_count as usize) + 1];
-                                            for r in 1..=self.processes_count {
-                                                st.missing_acks[r as usize] = true;
-                                            }
-                                        }
-                                    }
+                                let mut missing = vec![false; (self.processes_count as usize) + 1];
+                                for r in 1..=self.processes_count {
+                                    missing[r as usize] = true;
                                 }
+                                {
+                                    let mut g = self.resend_state.lock().await;
+                                    *g = Some(ResendState {
+                                        cmd: Arc::clone(&msg),
+                                        missing,
+                                    });
+                                }
+                                self.resend_notify.notify_one();
 
-                                self.register_client.broadcast(Broadcast {
-                                    cmd: msg
-                                }).await;
-                            },
-                            Mode::Idle => {},
+                                self.register_client
+                                    .broadcast(Broadcast { cmd: msg })
+                                    .await;
+                            }
+
+                            Mode::Idle => {}
                         }
 
                         self.value_from.clear();
                     }
+                }
 
-                },
-                SystemRegisterCommandContent::WriteProc { timestamp, write_rank, data_to_write } => {
+                SystemRegisterCommandContent::WriteProc {
+                    timestamp,
+                    write_rank,
+                    data_to_write,
+                } => {
                     if timestamp > self.ts || (timestamp == self.ts && write_rank > self.wr) {
                         self.ts = timestamp;
                         self.wr = write_rank;
                         self.val = data_to_write.clone();
-                        self.sectors_manager.write(self.sector_idx, &(data_to_write, timestamp, write_rank)).await;
+                        self.sectors_manager
+                            .write(self.sector_idx, &(data_to_write, timestamp, write_rank))
+                            .await;
                     }
 
-                    let ack = SystemRegisterCommand { 
+                    let ack = SystemRegisterCommand {
                         header: SystemCommandHeader {
                             process_identifier: self.self_ident,
                             msg_ident: cmd.header.msg_ident,
                             sector_idx: self.sector_idx,
-                        }, 
+                        },
                         content: SystemRegisterCommandContent::Ack,
                     };
 
-                    self.register_client.send(Send {
-                        cmd: Arc::new(ack),
-                        target: cmd.header.process_identifier
-                    }).await;
-                },
-                SystemRegisterCommandContent::Ack => {
+                    self.register_client
+                        .send(Send {
+                            cmd: Arc::new(ack),
+                            target: cmd.header.process_identifier,
+                        })
+                        .await;
+                }
 
+                SystemRegisterCommandContent::Ack => {
                     let Some(op_id) = self.op_id else { return; };
                     if op_id != cmd.header.msg_ident { return; }
                     if !matches!(self.phase, Phase::WriteBack) { return; }
@@ -609,13 +593,11 @@ pub mod atomic_register_public {
                     self.ack_from.insert(cmd.header.process_identifier);
 
                     {
-                        let mut guard = self.resend_state.lock().await;
-                        if let Some(st) = guard.as_mut() {
-                            if st.op_id == cmd.header.msg_ident {
-                                let src = cmd.header.process_identifier as usize;
-                                if src < st.missing_acks.len() {
-                                    st.missing_acks[src] = false;
-                                }
+                        let mut g = self.resend_state.lock().await;
+                        if let Some(st) = g.as_mut() {
+                            let src = cmd.header.process_identifier as usize;
+                            if src < st.missing.len() {
+                                st.missing[src] = false;
                             }
                         }
                     }
@@ -632,13 +614,11 @@ pub mod atomic_register_public {
                                     request_identifier: req_id,
                                     op_return: crate::OperationReturn::Read { read_data: val },
                                 }
-                            },
-                            Mode::Writing => {
-                                ClientCommandResponse {
-                                    status: crate::StatusCode::Ok,
-                                    request_identifier: req_id,
-                                    op_return: crate::OperationReturn::Write,
-                                }
+                            }
+                            Mode::Writing => ClientCommandResponse {
+                                status: crate::StatusCode::Ok,
+                                request_identifier: req_id,
+                                op_return: crate::OperationReturn::Write,
                             },
                             Mode::Idle => return,
                         };
@@ -652,22 +632,17 @@ pub mod atomic_register_public {
                         self.ack_from.clear();
 
                         {
-                            let mut guard = self.resend_state.lock().await;
-                            if let Some(st) = guard.as_mut() {
-                                if st.op_id == op_id {
-                                    st.done = true;
-                                }
-                            }
-                            // optional: clear state entirely
-                            *guard = None;
+                            let mut g = self.resend_state.lock().await;
+                            *g = None;
                         }
+                        self.resend_notify.notify_one();
 
                         cb(response).await;
-
                     }
                 }
             }
         }
+
     }
 }
 
