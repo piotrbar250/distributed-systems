@@ -105,15 +105,36 @@ async fn handle_connection(
 }
 
 pub async fn run_register_process(config: Configuration) {
-    let rank_ind = config.public.self_rank as usize -1;
+    let n = config.public.tcp_locations.len() as u8;
+    let self_rank = config.public.self_rank;
+    let self_idx = self_rank as usize - 1;
 
-    let bind_addr = format!("{}:{}", config.public.tcp_locations[rank_ind].0, config.public.tcp_locations[rank_ind].1);
+    let bind_addr = format!("{}:{}", config.public.tcp_locations[self_idx].0, config.public.tcp_locations[self_idx].1);
     let listener = TcpListener::bind(bind_addr).await.unwrap();
 
     let config = Arc::new(config);
 
     let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
-    let register_client: Arc<dyn RegisterClient> = Arc::new(MyRegisterClient { });
+
+    let mut internal_tx: Vec<Option<UnboundedSender<Arc<SystemRegisterCommand>>>> = vec![None; n as usize + 1];
+    
+    for target_rank in 1..=n {
+        if target_rank == self_rank {
+            continue;
+        }
+
+        let (tx, rx) = unbounded_channel();
+        internal_tx[target_rank as usize] = Some(tx);
+        let (thost, tport) = &config.public.tcp_locations[target_rank as usize - 1];
+        let addr = format!("{}:{}", thost, tport);
+        tokio::spawn(sender_worker(addr, rx, config.hmac_system_key.clone()));
+    }
+
+    let register_client: Arc<dyn RegisterClient> = Arc::new(MyRegisterClient {
+        self_ident: self_rank,
+        processes_count: n,
+        internal_tx
+    });
 
     let dispatcher = Dispatcher {
         config: Arc::clone(&config),
@@ -729,8 +750,10 @@ pub mod transfer_public {
 }
 
 pub mod register_client_public {
-    use crate::SystemRegisterCommand;
-    use std::sync::Arc;
+    use tokio::{net::TcpStream, sync::mpsc::{UnboundedReceiver, UnboundedSender}, time::sleep};
+
+    use crate::{EncodingError, RegisterCommand, SystemRegisterCommand, serialize_register_command};
+    use std::{alloc::System, arch::aarch64::int8x8_t, sync::Arc, time::Duration};
 
     #[async_trait::async_trait]
     /// We do not need any public implementation of this trait. It is there for use
@@ -744,19 +767,6 @@ pub mod register_client_public {
         async fn broadcast(&self, msg: Broadcast);
     }
 
-    pub struct MyRegisterClient {}
-
-    #[async_trait::async_trait]
-    impl RegisterClient for MyRegisterClient {
-        async fn send(&self, msg: Send) {
-
-        }
-
-        async fn broadcast(&self, msg: Broadcast) {
-
-        }
-    }
-
     pub struct Broadcast {
         pub cmd: Arc<SystemRegisterCommand>,
     }
@@ -765,5 +775,78 @@ pub mod register_client_public {
         pub cmd: Arc<SystemRegisterCommand>,
         /// Identifier of the target process. Those start at 1.
         pub target: u8,
+    }
+
+    pub async fn sender_worker(addr: String, mut internal_rx: UnboundedReceiver<Arc<SystemRegisterCommand>>, hmac_system_key: [u8; 64]) {
+
+        let mut socket: Option<TcpStream> = None;
+        let mut pending: Option<Arc<SystemRegisterCommand>> = None;
+
+        let delay: u64 = 50;
+
+        loop {
+            if pending.is_none() {
+                match internal_rx.recv().await {
+                    Some(cmd) => pending = Some(cmd),
+                    None => {
+                        eprintln!("sender_worker ERROR: internal_tx dropped");
+                        return;
+                    },
+                }
+            }
+
+            if socket.is_none() {
+                match TcpStream::connect(&addr).await {
+                    Ok(s) => socket = Some(s),
+                    Err(_) => {
+                        sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
+                }
+            }
+
+            let cmd = RegisterCommand::System((**pending.as_ref().unwrap()).clone());
+            
+            match serialize_register_command(&cmd, socket.as_mut().unwrap(), &hmac_system_key).await {
+                Ok(()) => {
+                    pending = None;
+                },
+                Err(EncodingError::IoError(_)) => {
+                    socket = None;
+                    sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("sender_worker fatal encode: {e:?}");
+                },
+            }
+        }
+    }
+
+    pub struct MyRegisterClient {
+        pub self_ident: u8,
+        pub processes_count: u8,
+        pub internal_tx: Vec<Option<UnboundedSender<Arc<SystemRegisterCommand>>>>
+    }
+
+
+    #[async_trait::async_trait]
+    impl RegisterClient for MyRegisterClient {
+        async fn send(&self, msg: Send) {
+            if let Some(tx) = &self.internal_tx[msg.target as usize] {
+                tx.send(msg.cmd).unwrap();
+            } else {
+                eprintln!("RegisterClient::send: no tx");
+            }
+        }
+
+        async fn broadcast(&self, msg: Broadcast) {
+            for target in 1..=self.processes_count {
+                self.send(Send {
+                    cmd: Arc::clone(&msg.cmd),
+                    target,
+                }).await;
+            }
+        }
     }
 }
