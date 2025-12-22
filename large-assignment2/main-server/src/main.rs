@@ -1,20 +1,11 @@
-use assignment_2_solution::{
-    ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, Configuration, OperationReturn, PublicConfiguration, RegisterCommand, SectorVec, deserialize_register_command, run_register_process, serialize_register_command
-};
-use assignment_2_test_utils::system::*;
-use assignment_2_test_utils::transfer::PacketBuilder;
-use hmac::Mac;
-use ntest::timeout;
-use serde_big_array::Array;
-use std::convert::TryInto;
+use assignment_2_solution::
+    deserialize_register_command
+;
 use std::net::SocketAddr;
-use std::time::Duration;
-use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 
-async fn handle_client(mut socket: TcpStream, client_addr: SocketAddr) {
+async fn handle_client(mut socket: TcpStream, _client_addr: SocketAddr) {
     loop {
         println!("paszlo");
         let hmac_client_key = [0u8; 32];

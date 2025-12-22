@@ -1,5 +1,5 @@
 use assignment_2_solution::{ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SectorVec, serialize_register_command};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 
 #[tokio::main]

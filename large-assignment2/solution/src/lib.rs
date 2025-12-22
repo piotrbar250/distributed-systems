@@ -1,13 +1,10 @@
 mod domain;
 mod sectors_manager_public;
 
-use std::{collections::{HashMap, VecDeque}, hash::Hash, io::Read, path::PathBuf, pin::Pin, sync::{Arc, atomic}};
+use std::{collections::{HashMap, VecDeque}, pin::Pin, sync::Arc};
 
 pub use crate::domain::*;
-use async_channel::unbounded;
 pub use atomic_register_public::*;
-use base64::display;
-use bincode::config::{self, standard};
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}, select, sync::{Mutex, mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel}, oneshot}};
@@ -166,16 +163,14 @@ pub async fn run_register_process(config: Configuration) {
 }
 
 pub mod atomic_register_public {
-    use hmac::digest::consts::False;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::interval;
     use uuid::Uuid;
 
     use crate::{
-        Broadcast, ClientCommandResponse, ClientRegisterCommand, ClientRegisterCommandContent, RegisterClient, SectorIdx, SectorVec, SectorsManager, Send, SuccessCb, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent, zero_sector
+        Broadcast, ClientCommandResponse, ClientRegisterCommand, ClientRegisterCommandContent, RegisterClient, SectorIdx, SectorVec, SectorsManager, Send, SuccessCb, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent
     };
-    use core::time;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -784,7 +779,7 @@ pub mod transfer_public {
     use bincode::error::{DecodeError, EncodeError};
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    use std::{io::{self, Error}, rc::Rc};
+    use std::io::Error;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     #[derive(Debug)]
     pub enum EncodingError {
@@ -874,7 +869,7 @@ pub mod register_client_public {
     use tokio::{net::TcpStream, sync::mpsc::{UnboundedReceiver, UnboundedSender}, time::sleep};
 
     use crate::{EncodingError, RegisterCommand, SystemRegisterCommand, serialize_register_command};
-    use std::{alloc::System, arch::aarch64::int8x8_t, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     #[async_trait::async_trait]
     /// We do not need any public implementation of this trait. It is there for use
