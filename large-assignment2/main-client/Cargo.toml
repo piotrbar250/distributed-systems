@@ -4,19 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait = "0.1"
 tokio = { version = "1.48", features = ["full"] }
-ntest = "0.9"
-tempfile = "3.23"
-env_logger = "0.11"
-log = "0.4"
-assignment-2-solution = { path = "../solution" }
-assignment-2-test-utils = { path = "../test-utils" }
-uuid = { version = "1.18", features = ["serde", "v4"] }
+bytes = "1.11"
+bincode = { version = "2.0", features = ["serde"] }
 hmac = "0.12"
 sha2 = "0.10"
-async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+log = "0.4"
 async-channel = "2.5"
-futures = "0.3"
-rand = "0.9"
-serial_test = "3.2"
+base64 = "0.22"
+derive_more = {version = "2.0.1", features = ["full"] }
 serde-big-array = "0.5"
+assignment-2-solution = { path = "../solution" }
+assignment-2-test-utils = { path = "../test-utils" }
+rand = "0.9"
