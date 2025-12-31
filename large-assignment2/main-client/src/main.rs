@@ -202,7 +202,7 @@ async fn read_test_utils() {
     let config = TestProcessesConfig2::new(3, port_range_start);
     // config.start().await;
 
-    let mut socket0 = config.connect(0).await;
+    let mut socket0 = config.connect(2).await;
     println!("connected");
     // let mut socket1 = config.connect(1).await;
 
@@ -222,20 +222,20 @@ async fn read_test_utils() {
 
     // fs::write("log.txt", format!("{:?}", response.content)).await.unwrap();
 
-    config.send_cmd(
-        &RegisterCommand::Client(ClientRegisterCommand {
-            header: ClientCommandHeader {
-                request_identifier: 1,
-                sector_idx: 0,
-            },
-            content: ClientRegisterCommandContent::Write {
-                data: SectorVec(Box::new(Array([97; 4096]))),
-            },
-        }),
-        &mut socket0,
-    ).await;
+    // config.send_cmd(
+    //     &RegisterCommand::Client(ClientRegisterCommand {
+    //         header: ClientCommandHeader {
+    //             request_identifier: 1,
+    //             sector_idx: 0,
+    //         },
+    //         content: ClientRegisterCommandContent::Write {
+    //             data: SectorVec(Box::new(Array([98; 4096]))),
+    //         },
+    //     }),
+    //     &mut socket0,
+    // ).await;
 
-    let response = config.read_response(&mut socket0).await;
+    // let response = config.read_response(&mut socket0).await;
 
     config
         .send_cmd(
