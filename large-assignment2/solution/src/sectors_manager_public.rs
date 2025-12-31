@@ -1,7 +1,7 @@
 
 use tokio::fs::{File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::{SECTOR_SIZE, SectorIdx, SectorVec};
 use std::collections::HashMap;
@@ -79,6 +79,7 @@ pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
         root_dir: path,
         root_dir_handle,
         index: Mutex::new(index),
+        fd_sem: Arc::new(Semaphore::new(450)),
     })
 }
 
@@ -92,6 +93,7 @@ struct MySectorsManager {
     root_dir: PathBuf,
     root_dir_handle: File,
     index: Mutex<HashMap<SectorIdx, Entry>>,
+    fd_sem: Arc<Semaphore>,
 }
 
 #[async_trait::async_trait]
@@ -105,6 +107,8 @@ impl SectorsManager for MySectorsManager {
         let Some(path) = path_opt else {
             return zero_sector();
         };
+
+        let _permit = self.fd_sem.clone().acquire_owned().await.unwrap();
 
         let mut f = match File::open(&path).await {
             Ok(f) => f,
@@ -138,12 +142,15 @@ impl SectorsManager for MySectorsManager {
             idx_map.get(&idx).map(|e| e.path.clone())
         };
 
+        let permit = self.fd_sem.clone().acquire_owned().await.unwrap();
+
         let mut tmp_file = File::create(&tmp_path).await.unwrap();
         tmp_file.write_all(&data.0[..]).await.unwrap();
         tmp_file.sync_data().await.unwrap();
         self.root_dir_handle.sync_all().await.unwrap();
 
         drop(tmp_file);
+        drop(permit);
         tokio::fs::rename(&tmp_path, &final_path).await.unwrap();
 
         self.root_dir_handle.sync_all().await.unwrap();
