@@ -37,7 +37,6 @@ pub async fn sender_worker(addr: String, mut internal_rx: UnboundedReceiver<Arc<
             match internal_rx.recv().await {
                 Some(cmd) => pending = Some(cmd),
                 None => {
-                    eprintln!("sender_worker ERROR: internal_tx dropped");
                     return;
                 },
             }
@@ -64,8 +63,8 @@ pub async fn sender_worker(addr: String, mut internal_rx: UnboundedReceiver<Arc<
                 sleep(Duration::from_millis(delay)).await;
                 continue;
             }
-            Err(e) => {
-                eprintln!("sender_worker fatal encode: {e:?}");
+            Err(_) => {
+                panic!();
             },
         }
     }
@@ -89,8 +88,6 @@ impl RegisterClient for MyRegisterClient {
 
         if let Some(tx) = &self.internal_tx[msg.target as usize] {
             tx.send(msg.cmd).unwrap();
-        } else {
-            eprintln!("RegisterClient::send: no tx");
         }
     }
 

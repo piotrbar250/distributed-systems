@@ -32,7 +32,6 @@ async fn write_client_response(
     let tag = caclulate_hmac_tag(&payload, hmac_client_key);
     let msg_len = (payload.len() + tag.len()) as u64;
 
-    println!("server msg len: {}", msg_len);
 
     socket.write_all(&msg_len.to_be_bytes()).await.map_err(EncodingError::IoError)?;
     socket.write_all(&payload).await.map_err(EncodingError::IoError)?;
@@ -127,7 +126,6 @@ pub async fn run_register_process(config: Configuration) {
 
     let bind_addr = format!("{}:{}", config.public.tcp_locations[self_idx].0, config.public.tcp_locations[self_idx].1);
     let listener = TcpListener::bind(&bind_addr).await.unwrap();
-    println!("idx: {}, listening on: {}", config.public.self_rank, bind_addr);
 
     let config = Arc::new(config);
 
