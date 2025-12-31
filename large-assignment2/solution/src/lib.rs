@@ -1,8 +1,8 @@
 mod domain;
-mod sectors_manager_public;
-mod register_client_public;
-mod transfer_public;
-mod atomic_register_public;
+pub mod sectors_manager_public;
+pub mod register_client_public;
+pub mod transfer_public;
+pub mod atomic_register_public;
 
 use std::{collections::{HashMap, VecDeque}, pin::Pin, sync::Arc};
 
@@ -10,7 +10,7 @@ pub use crate::domain::*;
 pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
-use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream}, select, sync::{Mutex, mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel}, oneshot}};
+use tokio::{io::AsyncWriteExt, net::{TcpListener, TcpStream, tcp::OwnedWriteHalf}, select, sync::{Mutex, mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel}, oneshot}};
 pub use transfer_public::*;
 
 fn zero_sector() -> SectorVec {
@@ -20,7 +20,7 @@ fn zero_sector() -> SectorVec {
 type SuccessCb = Box<dyn FnOnce(ClientCommandResponse) -> Pin<Box<dyn Future<Output = ()> + core::marker::Send>> + core::marker::Send + Sync>;
 
 async fn write_client_response(
-    socket: &mut TcpStream,
+    socket: &mut OwnedWriteHalf,
     msg: ClientCommandResponse,
     hmac_client_key: &[u8; 32],
 ) -> Result<(), EncodingError> {
@@ -53,35 +53,46 @@ fn make_invalid_response(cmd: &ClientRegisterCommand, status: StatusCode) -> Cli
 }
 
 async fn handle_connection(
-    mut socket: TcpStream,
+    socket: TcpStream,
     config: Arc<Configuration>,
     dispatcher: Arc<Dispatcher>,
 ) {
-    println!("idx: {}, new connection", config.public.self_rank);
     let hmac_system_key= &config.hmac_system_key;
     let hmac_client_key= &config.hmac_client_key;
 
-    loop {
+    let (mut reader_socket, mut writer_socket) = socket.into_split();
+    let (response_tx, mut response_rx) = unbounded_channel();
+    let hmac_client_key_copy = config.hmac_client_key;
 
-        let (cmd, valid) = match deserialize_register_command(&mut socket, hmac_system_key, hmac_client_key).await {
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = response_rx.recv().await {
+            if write_client_response(&mut writer_socket, msg, &hmac_client_key_copy).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let response_tx_copy = response_tx.clone();
+        let (cmd, valid) = match deserialize_register_command(&mut reader_socket, hmac_system_key, hmac_client_key).await {
             Ok(x) => x,
-            Err(_) => return,
+            Err(_) => break,
         };
 
         match cmd {
             RegisterCommand::Client(client_cmd) => {
                 if !valid {
                     let resp = make_invalid_response(&client_cmd, StatusCode::AuthFailure);
-                    if write_client_response(&mut socket, resp, hmac_client_key).await.is_err() {
-                        return;
+                    if response_tx_copy.send(resp).is_err() {
+                        break;
                     }
                     continue;
                 }
                 
                 if client_cmd.header.sector_idx >= config.public.n_sectors {
                     let resp = make_invalid_response(&client_cmd, StatusCode::InvalidSectorIndex);
-                    if write_client_response(&mut socket, resp, hmac_client_key).await.is_err() {
-                        return;
+                    if response_tx_copy.send(resp).is_err() {
+                        break;
                     }
                     continue;
                 }
@@ -90,22 +101,23 @@ async fn handle_connection(
                 
                 dispatcher.handle_client(client_cmd, oneshot_tx).await;
 
-                let resp = match oneshot_rx.await {
-                    Ok(resp) => resp,
-                    Err(_) => return,
-                };
-
-                _ = write_client_response(&mut socket, resp, hmac_client_key).await;
-
+                tokio::spawn(async move {
+                    if let Ok(resp) = oneshot_rx.await {
+                        if !response_tx_copy.is_closed() {
+                            _ = response_tx_copy.send(resp);
+                        }
+                    }
+                });
             },
             RegisterCommand::System(system_cmd) => {
-                if !valid{
-                    return;
+                if !valid {
+                    break;
                 }
                 dispatcher.handle_system(system_cmd).await;
             },
         }
     }
+    writer_handle.abort();
 }
 
 pub async fn run_register_process(config: Configuration) {
