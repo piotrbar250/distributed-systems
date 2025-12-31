@@ -121,7 +121,7 @@ pub async fn run_register_process(config: Configuration) {
 
     let sectors_manager = build_sectors_manager(config.public.storage_dir.clone()).await;
 
-    let mut internal_tx: Vec<Option<UnboundedSender<Arc<SystemRegisterCommand>>>> = vec![None; n as usize + 1];
+    let mut internal_tx: Vec<Option<UnboundedSender<LinkOperation>>> = vec![None; n as usize + 1];
     
     for target_rank in 1..=n {
         if target_rank == self_rank {
@@ -137,12 +137,7 @@ pub async fn run_register_process(config: Configuration) {
 
     let (local_tx, mut local_rx) = unbounded_channel();
 
-    let register_client: Arc<dyn RegisterClient> = Arc::new(MyRegisterClient {
-        self_ident: self_rank,
-        processes_count: n,
-        local_tx,
-        internal_tx,
-    });
+    let register_client = build_register_client(self_rank, n, local_tx, internal_tx).await;
 
     let dispatcher = Dispatcher {
         config: Arc::clone(&config),

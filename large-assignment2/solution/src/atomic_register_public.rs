@@ -1,9 +1,10 @@
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::interval;
 use uuid::Uuid;
 
 use crate::{
-    Broadcast, ClientCommandResponse, ClientRegisterCommand, ClientRegisterCommandContent, RegisterClient, SectorIdx, SectorVec, SectorsManager, Send, SuccessCb, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent
+    Broadcast, ClientCommandResponse, ClientRegisterCommand, ClientRegisterCommandContent, Key, RegisterClient, SectorIdx, SectorVec, SectorsManager, Send, SuccessCb, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent
 };
 use std::collections::HashSet;
 use std::future::Future;
@@ -81,7 +82,8 @@ pub async fn build_atomic_register(
         pending_req_id: None,
         pending_callback: None,
         resend_state,
-        resend_notify
+        resend_notify,
+        key_tx: register_client.
     })
 }
 
@@ -160,6 +162,7 @@ pub struct MyAtomicRegister {
     pending_callback: Option<SuccessCb>,
     resend_state: Arc<Mutex<Option<ResendState>>>,
     resend_notify: Arc<Notify>,
+    key_tx: UnboundedSender<Key>,
 }
 
 impl MyAtomicRegister {
