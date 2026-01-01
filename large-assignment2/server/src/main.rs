@@ -9,22 +9,19 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-
-pub struct TestProcessesConfig2 {
+pub struct TestProcessesConfigManual {
     hmac_client_key: Vec<u8>,
     hmac_system_key: Vec<u8>,
     storage_dirs: Vec<PathBuf>,
     tcp_locations: Vec<(String, u16)>,
 }
 
-impl TestProcessesConfig2 {
+impl TestProcessesConfigManual {
     pub const N_SECTORS: u64 = 65536;
 
     #[allow(clippy::missing_panics_doc, clippy::must_use_candidate)]
     pub fn new(processes_count: usize, port_range_start: u16) -> Self {
-        TestProcessesConfig2 {
-            // hmac_client_key: (0..32).map(|_| rand::rng().random_range(0..255)).collect(),
-            // hmac_system_key: (0..64).map(|_| rand::rng().random_range(0..255)).collect(),
+        TestProcessesConfigManual {
             hmac_client_key: (0..32).map(|_| 1).collect(),
             hmac_system_key: (0..64).map(|_| 2).collect(),
             storage_dirs: (0..processes_count)
@@ -53,7 +50,7 @@ impl TestProcessesConfig2 {
                     .clone(),
                 tcp_locations: self.tcp_locations.clone(),
                 self_rank: u8::try_from(proc_idx + 1).unwrap(),
-                n_sectors: TestProcessesConfig2::N_SECTORS,
+                n_sectors: TestProcessesConfigManual::N_SECTORS,
             },
             hmac_system_key: self.hmac_system_key.clone().try_into().unwrap(),
             hmac_client_key: self.hmac_client_key.clone().try_into().unwrap(),
@@ -150,6 +147,6 @@ async fn main() {
             std::process::exit(2);
         });
 
-    let config = TestProcessesConfig2::new(3, 6000);
+    let config = TestProcessesConfigManual::new(3, 6000);
     config.start_single(port_range_start as usize - 6000).await;
 }
