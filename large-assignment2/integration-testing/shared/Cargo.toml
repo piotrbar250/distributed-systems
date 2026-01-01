@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+assignment-2-solution = { workspace = true }
+assignment-2-test-utils = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde-big-array = { workspace = true }
