@@ -7,6 +7,10 @@ mod domain;
 #[non_exhaustive]
 pub struct Raft {
     // TODO you can add fields to this struct.
+    config: ServerConfig,
+    state_machine: Box<dyn StateMachine>,
+    stable_storage: Box<dyn StableStorage>,
+    message_sender: Box<dyn RaftSender>,
 }
 
 impl Raft {
@@ -19,7 +23,13 @@ impl Raft {
         stable_storage: Box<dyn StableStorage>,
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> {
-        todo!()
+        let raft = system.register_module(|_| Raft {
+            config,
+            state_machine,
+            stable_storage,
+            message_sender,
+        }).await;
+        raft
     }
 }
 
