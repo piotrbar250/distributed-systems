@@ -1,7 +1,6 @@
 [package]
-name = "assignment-3-test-utils"
-version = "0.2.0"
-authors = ["Filip Plata <fp371335@students.mimuw.edu.pl>", "Wojciech Ciszewski <w.ciszewski2@student.uw.edu.pl>", "Maciej Matraszek <m.matraszek@mimuw.edu.pl>"]
+name = "main"
+version = "0.1.0"
 edition = "2024"
 
 [dependencies]
@@ -14,7 +13,4 @@ log = "0.4"
 rand = "0.9"
 module_system = { path = "../../Async-Message-Dispatcher", package = "assignment-1-solution" }
 assignment-3-solution = { path = "../solution" }
-
-[lib]
-name = "assignment_3_test_utils"
-path = "lib.rs"
+assignment-3-test-utils = { path = "../test-utils" }

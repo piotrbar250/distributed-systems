@@ -1,5 +1,5 @@
 use module_system::{Handler, ModuleRef, System, TimerHandle};
-use std::collections::HashSet;
+use std::{collections::HashSet, hash::Hash};
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -167,7 +167,6 @@ impl Raft {
                 },
             })
             .await;
-        RaftMessageContent::RequestVote { candidate_id: () }
     }
 
     // -------------
@@ -219,6 +218,41 @@ impl Handler<Init> for Raft {
     }
 }
 
+impl Raft {
+    async fn elect_leader(&mut self) {
+        self.process_type = ProcessType::Leader;
+        self.state.leader_id = Some(self.config.self_id);
+        self.update_state();
+
+        self.reset_timer(self.config.election_timeout / 10).await;
+        // self.broadcast_heartbeat().await;  - I let the timeout announce new leader
+    }
+
+    async fn start_election(&mut self) {
+        self.update_term(self.state.current_term + 1);
+        self.state.voted_for = Some(self.config.self_id);
+        self.update_state();
+
+        let mut votes_received = HashSet::new();
+
+        if self.config.processes_count == 1 {
+            self.elect_leader().await;
+            return;
+        }
+
+        votes_received.insert(self.config.self_id);
+        self.process_type = ProcessType::Candidate { 
+            votes_received,
+        };
+        self.reset_timer(self.config.election_timeout).await;
+
+        self.sender.broadcast(RaftMessage {
+            header: RaftMessageHeader { term: self.state.current_term },
+            content: RaftMessageContent::RequestVote { candidate_id: self.config.self_id }
+        }).await;
+    }
+}
+
 /// Handle timer timeout.
 #[async_trait::async_trait]
 impl Handler<Timeout> for Raft {
@@ -226,13 +260,14 @@ impl Handler<Timeout> for Raft {
         if self.enabled {
             match &mut self.process_type {
                 ProcessType::Follower => {
-                    unimplemented!();
+                    self.start_election().await;
                 }
                 ProcessType::Candidate { .. } => {
-                    unimplemented!();
+                    self.start_election().await;
                 }
                 ProcessType::Leader => {
-                    unimplemented!();
+                    self.broadcast_heartbeat().await;
+                    self.reset_timer(self.config.election_timeout / 10).await;
                 }
             }
         }
@@ -243,30 +278,74 @@ impl Handler<Timeout> for Raft {
 impl Handler<RaftMessage> for Raft {
     async fn handle(&mut self, msg: RaftMessage) {
         if self.enabled {
-            // Reset the term and become a follower if we're outdated:
-            self.check_for_higher_term(&msg);
-            // Received term is <= our term
 
-            // TODO message specific processing. Heartbeat is given as an example:
+            let old_term = self.state.current_term;
+            let was_leader = matches!(&self.process_type, ProcessType::Leader);
+
+            self.check_for_higher_term(&msg);
+
+            if self.state.current_term != old_term {
+                self.update_state();
+                if was_leader {
+                    self.reset_timer(self.config.election_timeout).await;
+                }
+            }
+
             match (&mut self.process_type, msg.content) {
                 (_, RaftMessageContent::Heartbeat { leader_id }) => {
                     self.handle_heartbeat(leader_id, msg.header.term).await;
                 },
-
                 (_, RaftMessageContent::RequestVote { candidate_id }) => {
-                    // jesli ten term ktory dostales >= current term && self state voted for
-                    // glosujesz
-                    // 
-                },
-                (_, RaftMessageContent::RequestVoteResponse { granted, source }) => {
-                    // jesli ten term ktory dostales >= current term && self state voted for
-                    // glosujesz
-                    // 
-                },
+                    let mut granted = false;
 
-                _ => {
-                    unimplemented!();
-                }
+                    if self.state.current_term == msg.header.term {
+                        match self.state.voted_for {
+                            None => {
+                                granted = true;
+                                self.state.voted_for = Some(candidate_id);
+                                self.state.leader_id = None;
+                                self.update_state();
+                                self.reset_timer(self.config.election_timeout).await;
+                            },
+                            Some(id) if id == candidate_id => {
+                                granted = true;
+                                self.reset_timer(self.config.election_timeout).await;
+                            },
+                            _ => {}
+                        }
+                    }
+                    
+                    self.sender.send(
+                        &candidate_id, 
+                        RaftMessage {
+                            header: RaftMessageHeader {
+                                term: self.state.current_term,
+                            },
+                            content: RaftMessageContent::RequestVoteResponse {
+                                granted,
+                                source: self.config.self_id,
+                            },
+                        },
+                    ).await;
+                },
+                (
+                    ProcessType::Candidate { votes_received }, 
+                    RaftMessageContent::RequestVoteResponse { granted, source }
+                ) => {
+                    if self.state.current_term != msg.header.term {
+                        return;
+                    }
+                    if granted {
+                        votes_received.insert(source);
+                    }
+                        
+                    if votes_received.len() > self.config.processes_count / 2 {
+                        self.elect_leader().await;
+                    }
+
+                },
+                (_, RaftMessageContent::RequestVoteResponse {..}) => { },
+                (_, RaftMessageContent::HeartbeatResponse) => {},
             }
         }
     }
